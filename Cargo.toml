@@ -1,0 +1,38 @@
+[package]
+name = "latke"
+version = "0.0.0"
+authors = ["raykast <rookie1286@gmail.com>"]
+edition = "2021"
+description = "A tool for hashing files on a filesystem to locate duplicates."
+documentation = "https://docs.rs/latke/"
+readme = "README.md"
+# homepage = TODO
+repository = "https://github.com/ray-kast/latke"
+license = "MIT OR Apache-2.0"
+keywords = ["hash", "files", "deduplication"]
+categories = ["command-line-utilities", "filesystem"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ahash = "0.7.6"
+anyhow = "1.0.51"
+clap = { version = "3.0.0-rc.4", features = ["derive"] }
+dashmap = "5.0.0"
+env_logger = "0.9.0"
+log = "0.4.14"
+sha2 = "0.10.0"
+topograph = "0.2.0-alpha.1"
+
+# anyhow = "1.0.41"
+# atty = "0.2.14"
+# bincode = "1.3.3"
+# crossbeam = "0.8.1"
+# crossterm = "0.20.0"
+# dashmap = { version = "4.0.2", features = ["rayon", "serde"] }
+# serde_json = "1.0.64"
+# rayon = "1.5.1"
+# serde = { version = "1.0.126", features = ["derive"] }
+# sha2 = "0.9.5"
+# structopt = "0.3.21"
+# thiserror = "1.0.25"
