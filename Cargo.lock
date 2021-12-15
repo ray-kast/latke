@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "latke"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -542,9 +542,9 @@ checksum = "0066c8d12af8b5acd21e00547c3797fde4e8677254a7ee429176ccebbe93dd80"
 
 [[package]]
 name = "topograph"
-version = "0.2.0-alpha.1"
+version = "0.2.1-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5df278c9eca1e2922b86a545ee6264f57f5d47957d57ff001c7522805a7feb8b"
+checksum = "7f3ad2aad3a52fd435a71b86b1a8af76162084118cdfa357fc0fdce0a949063c"
 dependencies = [
  "crossbeam",
  "dispose",

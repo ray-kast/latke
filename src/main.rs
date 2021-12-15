@@ -1,14 +1,19 @@
 #![warn(clippy::pedantic, clippy::cargo)]
 
 mod dev_id;
+mod dir;
+mod file;
 mod hash;
 
 use std::{
+    cmp,
+    cmp::{Eq, Ord, PartialEq, PartialOrd},
     ffi::OsStr,
+    fmt,
+    fmt::{Display, Formatter},
     fs,
-    fs::{File, Metadata},
-    io,
-    io::BufReader,
+    fs::Metadata,
+    hash::{Hash, Hasher},
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
@@ -17,52 +22,121 @@ use std::{
     },
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::Parser;
 use dev_id::DevId;
-use hash::{DashMap, DashSet};
-use log::{error, info, trace};
-use sha2::{Digest, Sha512};
-use topograph::{graph, graph::DependencyBag, prelude::*, threaded};
+use hash::{DashMap, DashSet, HashMap, HashSet};
+use log::{error, trace, warn};
+use topograph::{graph, prelude::*, threaded};
 
-pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
+type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
+
+// May change later
+type Meta = Metadata;
+
+#[derive(Debug, Clone)]
+pub enum Item {
+    File(PathBuf, Meta),
+    Dir(PathBuf, Meta),
+    Symlink(PathBuf, Meta),
+}
+
+impl Display for Item {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::File(p, _) => write!(f, "File {:?}", p),
+            Self::Dir(p, _) => write!(f, "Directory {:?}", p),
+            Self::Symlink(p, _) => write!(f, "Symlink {:?}", p),
+        }
+    }
+}
+
+impl Ord for Item {
+    fn cmp(&self, rhs: &Item) -> cmp::Ordering {
+        let ret = self.path().cmp(rhs.path());
+        debug_assert!(!matches!(ret, cmp::Ordering::Equal) || self == rhs);
+        ret
+    }
+}
+
+impl PartialOrd for Item {
+    fn partial_cmp(&self, rhs: &Item) -> Option<cmp::Ordering> { Some(self.cmp(rhs)) }
+}
+
+impl Eq for Item {}
+impl PartialEq for Item {
+    fn eq(&self, rhs: &Item) -> bool { self.path() == rhs.path() }
+}
+
+impl Hash for Item {
+    fn hash<H: Hasher>(&self, hash: &mut H) { self.path().hash(hash) }
+}
+
+impl Item {
+    fn new(path: PathBuf, meta: Metadata) -> Self {
+        if meta.is_symlink() {
+            Self::Symlink(path, meta)
+        } else if meta.is_dir() {
+            Self::Dir(path, meta)
+        } else if meta.is_file() {
+            Self::File(path, meta)
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::File(p, _) | Self::Dir(p, _) | Self::Symlink(p, _) => p,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Job {
-    File(PathBuf),
-    Dir(PathBuf, Option<DevId>),
-    Symlink(PathBuf),
-    FinalizeDir(PathBuf),
+    Item(Item, Option<DevId>),
+    FinalizeDir(PathBuf, HashSet<Item>),
+}
+
+impl Display for Job {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::Item(i, _) => write!(f, "{}", i),
+            Self::FinalizeDir(p, c) => write!(f, "Finalize dir ({}) {:?}", c.len(), p),
+        }
+    }
 }
 
 impl Job {
     fn path(
         path: PathBuf,
-        meta: &Metadata,
+        meta: Metadata,
         root_id: Option<DevId>,
         worker: &Worker,
     ) -> Result<Option<Self>> {
         let path_id =
             DevId::new(&path).with_context(|| format!("Failed to get device ID for {:?}", path))?;
 
-        if root_id.map_or(false, |r| r == path_id) {
+        if root_id.map_or(false, |r| r != path_id) {
             return Ok(None);
         }
 
-        Ok(Some(if meta.is_symlink() {
-            worker.total_files.fetch_add(1, Ordering::Relaxed);
-            Job::Symlink(path)
-        } else if meta.is_dir() {
-            worker.total_dirs.fetch_add(1, Ordering::Relaxed);
-            Job::Dir(path, root_id)
-        } else if meta.is_file() {
-            worker.total_files.fetch_add(1, Ordering::Relaxed);
-            Job::File(path)
-        } else {
-            unreachable!();
-        }))
+        let item = Item::new(path, meta);
+
+        match item {
+            Item::File(..) | Item::Symlink(..) => {
+                worker.total_files.fetch_add(1, Ordering::Relaxed);
+            },
+            Item::Dir(..) => {
+                worker.total_dirs.fetch_add(1, Ordering::Relaxed);
+            },
+        }
+
+        Ok(Some(Self::Item(item, root_id)))
     }
 }
+
+type Handle<'a> = graph::Handle<threaded::Handle<'a, graph::Job<Job>>>;
 
 #[derive(Debug)]
 pub struct Worker {
@@ -72,21 +146,22 @@ pub struct Worker {
     total_files: AtomicUsize,
     total_dirs: AtomicUsize,
     seen: AssertUnwindSafe<DashSet<PathBuf>>,
-    hashes: AssertUnwindSafe<DashMap<PathBuf, [u8; 64]>>,
+    hash_for_path: AssertUnwindSafe<DashMap<PathBuf, file::Hash>>,
+    file_hashes: AssertUnwindSafe<DashMap<file::Hash, HashMap<PathBuf, Metadata>>>,
 }
 
 impl Worker {
     fn tally(&self, job: &Job) -> bool {
         let path = match job {
-            Job::File(p) | Job::Symlink(p) => {
+            Job::Item(Item::File(p, _) | Item::Symlink(p, _), _) => {
                 self.files_done.fetch_add(1, Ordering::Relaxed);
                 p
             },
-            Job::Dir(p, _) => {
+            Job::Item(Item::Dir(p, _), _) => {
                 self.dirs_done.fetch_add(1, Ordering::Relaxed);
                 p
             },
-            Job::FinalizeDir(_) => return true,
+            Job::FinalizeDir(..) => return true,
         };
 
         self.seen.insert(path.clone())
@@ -153,12 +228,14 @@ fn run(
         total_files: AtomicUsize::new(0),
         total_dirs: AtomicUsize::new(0),
         seen: AssertUnwindSafe(DashSet::default()),
-        hashes: AssertUnwindSafe(DashMap::default()),
+        hash_for_path: AssertUnwindSafe(DashMap::default()),
+        file_hashes: AssertUnwindSafe(DashMap::default()),
     });
     let worker2 = worker.clone();
 
     let pool = threaded::Builder::default()
         .num_threads(threads)
+        .lifo(true)
         .build_graph(move |j, h| process(j, h, &worker2).map_err(|e| error!("Job failed: {:?}", e)))
         .context("Failed to initialize thread pool")?;
 
@@ -172,7 +249,7 @@ fn run(
             )
         };
 
-        if let Some(job) = Job::path(path, &meta, root_id, &worker)? {
+        if let Some(job) = Job::path(path, meta, root_id, &worker)? {
             pool.push(job);
         }
     }
@@ -182,78 +259,17 @@ fn run(
     Ok(())
 }
 
-fn process(
-    job: Job,
-    handle: graph::Handle<threaded::Handle<graph::Job<Job>>>,
-    worker: &Arc<Worker>,
-) -> Result {
-    trace!("{:?}", job);
-
-    let Worker {
-        block_size,
-        // ref files_done,
-        // ref dirs_done,
-        // ref total_files,
-        // ref total_dirs,
-        ref seen,
-        ref hashes,
-        .. // TODO: remove
-    } = **worker;
+fn process(job: Job, handle: Handle, worker: &Arc<Worker>) -> Result {
+    trace!("{}", job);
 
     if !worker.tally(&job) {
         return Ok(()); // Nothing to do
     }
 
     match job {
-        Job::File(path) => {
-            let mut file = BufReader::with_capacity(
-                block_size,
-                File::open(&path).with_context(|| format!("Failed to open file {:?}", path))?,
-            );
-
-            let mut hasher = Sha512::new();
-            io::copy(&mut file, &mut hasher)
-                .with_context(|| format!("Failed to hash {:?}", path))?;
-            let hash = hasher.finalize();
-
-            let mut bytes = [0u8; 64];
-            bytes[..].copy_from_slice(hash.as_slice());
-
-            assert!(hashes.insert(path, bytes).is_none());
-        },
-        Job::Dir(path, root_id) => {
-            let mut children = Vec::new();
-
-            for child in fs::read_dir(&path)
-                .with_context(|| format!("Failed to open directory {:?}", path))?
-            {
-                match child.and_then(|c| Ok((c.path(), c.metadata()?))) {
-                    Ok((path, meta)) => {
-                        info!("{:?}", path);
-
-                        if seen.contains(&path) {
-                            continue;
-                        }
-
-                        if let Some(job) = Job::path(path, &meta, root_id, worker)? {
-                            children.push(job);
-                        }
-                    },
-                    Err(e) => error!("Error while reading directory {:?}: {:?}", path, e),
-                }
-            }
-
-            let mut deps = handle.create_node_or_run(Job::FinalizeDir(path), children.len());
-
-            for job in children {
-                handle.push_dependency(job, deps.as_mut().map(DependencyBag::take));
-            }
-        },
-        Job::Symlink(path) => todo!("Handle symlink {:?}", path),
-        Job::FinalizeDir(path) => {
-            todo!("Handle finalizing dir {:?}", path)
-        },
+        Job::Item(Item::File(path, meta), _) => file::hash(path, meta, worker),
+        Job::Item(Item::Dir(path, _), root_id) => dir::recurse(path, root_id, handle, worker),
+        Job::Item(Item::Symlink(path, _), _) => bail!("TODO: Handle symlink {:?}", path),
+        Job::FinalizeDir(path, children) => dir::finalize(&path, children, worker),
     }
-
-    Ok(())
 }
